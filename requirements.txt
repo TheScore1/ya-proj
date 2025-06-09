@@ -1,0 +1,8 @@
+fastapi>=0.95.0
+uvicorn[standard]>=0.23.0
+sqlalchemy>=1.4.0
+asyncpg>=0.27.0
+psycopg2-binary>=2.9.0
+pydantic>=1.10.0
+requests
+httpx
