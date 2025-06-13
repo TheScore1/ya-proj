@@ -17,7 +17,7 @@ class Instrument(Base):
     __tablename__ = "instruments"
 
     id = Column(UUID, unique=True, primary_key=True, index=True, default=uuid.uuid4)
-    ticker = Column(String, index=True)
+    ticker = Column(String, unique=True, index=True)
     name = Column(String, index=True)
 
 class OrderBook(Base):
