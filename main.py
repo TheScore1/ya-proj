@@ -712,20 +712,11 @@ async def cancel_order(
                     balance.reserved = 0  # Защита от отрицательных значений
                 db.add(balance)
 
-    # Проверяем наличие в стакане перед удалением
-    in_orderbook = await db.execute(
-        select(OrderBook)
-        .where(OrderBook.ticker == order.ticker)
-        .where(OrderBook.price == order.price)
-        .where(OrderBook.qty == (order.qty - order.filled))
+    # Удаляем из стакана по ID ордера
+    await db.execute(
+        delete(OrderBook)
+        .where(OrderBook.order_id == order.id)
     )
-    if in_orderbook.scalar_one_or_none():
-        await db.execute(
-            delete(OrderBook)
-            .where(OrderBook.ticker == order.ticker)
-            .where(OrderBook.price == order.price)
-            .where(OrderBook.qty == (order.qty - order.filled))
-        )
 
     # Помечаем ордер как отмененный
     order.status = Status.CANCELLED
