@@ -256,14 +256,15 @@ async def get_transactions_by_ticker(
                     for row in result.scalars()]
     return transactions
 
+
 @app.post("/api/v1/order",
           response_model=OrderCreateResponse,
           tags=["Order"],
           summary="Создать заказ")
 async def create_order(
-    data: OrderCreateRequest,
-    authorization: str = Security(api_key_header),
-    db: AsyncSession = Depends(get_db)):
+        data: OrderCreateRequest,
+        authorization: str = Security(api_key_header),
+        db: AsyncSession = Depends(get_db)):
     if not authorization.upper().startswith("TOKEN "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -285,7 +286,7 @@ async def create_order(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="User does not exist")
 
-        # Проверка доступности инструмента
+    # Проверка доступности инструмента
     instrument = await db.execute(
         select(Instrument).where(Instrument.ticker == data.ticker)
     )
@@ -340,40 +341,45 @@ async def create_order(
                 detail=f"Insufficient available balance. Available: {available}, Requested: {data.qty}"
             )
     elif data.direction == Direction.BUY:
-        # Рассчитываем общую стоимость ордера
-        total_cost = data.price * data.qty if data.price else 0
+        # РАЗДЕЛЕНИЕ ДЛЯ РЫНОЧНЫХ И ЛИМИТНЫХ ОРДЕРОВ
+        if data.price is not None:  # Лимитный ордер
+            total_cost = data.price * data.qty
 
-        # Проверяем баланс RUB
-        rub_balance = await db.execute(
-            select(Balance)
-            .where(and_(
-                Balance.user_id == requesting_user.id,
-                Balance.instrument_id == rub_instrument.id
-            ))
-        )
-        rub_balance = rub_balance.scalar_one_or_none()
-
-        # Рассчитываем доступный баланс (общий - зарезервированный)
-        available_rub = (rub_balance.amount - rub_balance.reserved) if rub_balance else 0
-
-        if available_rub < total_cost:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Insufficient available RUB balance. Available: {available_rub}, Required: {total_cost}"
+            # Проверяем баланс RUB
+            rub_balance = await db.execute(
+                select(Balance)
+                .where(and_(
+                    Balance.user_id == requesting_user.id,
+                    Balance.instrument_id == rub_instrument.id
+                ))
             )
+            rub_balance = rub_balance.scalar_one_or_none()
 
-        # Резервируем средства
-        if not rub_balance:
-            rub_balance = Balance(
-                user_id=requesting_user.id,
-                instrument_id=rub_instrument.id,
-                amount=0,
-                reserved=total_cost
-            )
-            db.add(rub_balance)
-        else:
-            rub_balance.reserved += total_cost
-            db.add(rub_balance)
+            # Рассчитываем доступный баланс (общий - зарезервированный)
+            available_rub = (rub_balance.amount - rub_balance.reserved) if rub_balance else 0
+
+            if available_rub < total_cost:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Insufficient available RUB balance. Available: {available_rub}, Required: {total_cost}"
+                )
+
+            # Резервируем средства
+            if not rub_balance:
+                rub_balance = Balance(
+                    user_id=requesting_user.id,
+                    instrument_id=rub_instrument.id,
+                    amount=0,
+                    reserved=total_cost
+                )
+                db.add(rub_balance)
+            else:
+                rub_balance.reserved += total_cost
+                db.add(rub_balance)
+        else:  # Рыночный ордер
+            # Для рыночных ордеров пропускаем проверку баланса на этом этапе
+            # Фактическая проверка будет выполняться в process_market_order
+            pass
 
     # Создаем ордер
     order = Order(
@@ -396,9 +402,20 @@ async def create_order(
         else:  # Лимитный ордер
             await process_limit_order(db, order, instrument)
     except Exception as e:
-        # Отменяем ордер в случае ошибки
+        # В случае ошибки отменяем ордер
         order.status = Status.CANCELLED
         db.add(order)
+        await db.flush()
+
+        # Возвращаем зарезервированные средства при необходимости
+        if data.direction == Direction.BUY and data.price is not None:
+            if rub_balance:
+                rub_balance.reserved -= data.price * data.qty
+                if rub_balance.reserved < 0:
+                    rub_balance.reserved = 0
+                db.add(rub_balance)
+                await db.flush()
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing order: {str(e)}"
@@ -1080,9 +1097,31 @@ async def deposit(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key")
-    result = await db.execute(
-        select(Balance)
-        .where(and_(Balance.user_id == data.user_id)))
+
+    # Проверка прав администратора
+    if requesting_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can deposit funds")
+
+    # Поиск инструмента по тикеру
+    instrument = await db.execute(
+        select(Instrument).where(Instrument.ticker == data.ticker))
+    instrument = instrument.scalar_one_or_none()
+
+    if not instrument:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Instrument with ticker {data.ticker} not found")
+
+    # Получение или создание баланса
+    balance = await get_or_create_balance(db, data.user_id, instrument.id)
+
+    # Пополнение баланса
+    balance.amount += data.amount
+    db.add(balance)
+    await db.commit()
+
     return BalanceDepositResponse(success=True)
 
 @app.post("/api/v1/admin/balance/withdraw",
@@ -1105,9 +1144,48 @@ async def withdraw(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key")
-    result = await db.execute(
+    # Проверка прав администратора
+    if requesting_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can withdraw funds")
+
+    # Поиск инструмента по тикеру
+    instrument = await db.execute(
+        select(Instrument).where(Instrument.ticker == data.ticker))
+    instrument = instrument.scalar_one_or_none()
+
+    if not instrument:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Instrument with ticker {data.ticker} not found")
+
+    # Получение баланса
+    balance = await db.execute(
         select(Balance)
-        .where(and_(Balance.user_id == data.user_id)))
+        .where(and_(
+            Balance.user_id == data.user_id,
+            Balance.instrument_id == instrument.id
+        )))
+    balance = balance.scalar_one_or_none()
+
+    if not balance:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User has no balance for this instrument")
+
+    # Проверка достаточности средств
+    available = balance.amount - balance.reserved
+    if available < data.amount:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient available balance. Available: {available}, Requested: {data.amount}")
+
+    # Снятие средств
+    balance.amount -= data.amount
+    db.add(balance)
+    await db.commit()
+
     return BalanceDepositResponse(success=True)
 
 @app.get("/api/v1/hi/{name}",
