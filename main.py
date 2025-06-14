@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 from models import User, Instrument, OrderBook, Transaction, Balance, Order
 from sqlalchemy import select, asc, desc, and_, delete, func, literal
 from sqlalchemy.ext.asyncio import AsyncSession
-from db import get_db
+from db import get_db, AsyncSessionLocal
 from enum import Enum
 from datetime import datetime
 import httpx
@@ -184,11 +184,11 @@ def validate_uuid(uuid_str: str):
 
 @app.on_event("startup")
 async def startup_event():
-    db = get_db()
-    result = await db.execute(select(Instrument).where(Instrument.ticker == "RUB"))
-    if not result.scalar_one_or_none():
-        db.add(Instrument(ticker="RUB", name="Russian Ruble"))
-        await db.commit()
+    async with AsyncSessionLocal() as db:  # Используем контекстный менеджер сессии
+        result = await db.execute(select(Instrument).where(Instrument.ticker == "RUB"))
+        if not result.scalar_one_or_none():
+            db.add(Instrument(ticker="RUB", name="Russian Ruble"))
+            await db.commit()
 
 # Public
 @app.post("/api/v1/public/register",
