@@ -332,7 +332,7 @@ async def create_order(
                     Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
                     Order.price.isnot(None)
                 ))
-                .order_by(asc(Order.price))
+                .order_by(asc(Order.price), asc(Order.timestamp))
             )
             asks = asks_q.scalars().all()
 
@@ -569,6 +569,7 @@ async def process_market_order(db: AsyncSession, order: Order, instrument: Instr
         select(Instrument).where(Instrument.ticker == "RUB")
     )
     rub_instrument = rub_instrument.scalar_one_or_none()
+
     if not rub_instrument:
         rub_instrument = Instrument(ticker="RUB", name="Russian Ruble")
         db.add(rub_instrument)
@@ -585,7 +586,7 @@ async def process_market_order(db: AsyncSession, order: Order, instrument: Instr
                 Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
                 Order.price.isnot(None)
             ))
-            .order_by(asc(Order.price))
+            .order_by(asc(Order.price), asc(Order.timestamp))
         )
         matching_orders = best_orders.scalars().all()
 
@@ -593,8 +594,7 @@ async def process_market_order(db: AsyncSession, order: Order, instrument: Instr
             # нет ликвидности — освобождаем резерв RUB и кидаем 400
             rub_balance = await get_or_create_balance(db, order.user_id, rub_instrument.id)
             # total_cost мы заранее резервировали в create_order
-            rub_balance.reserved = max(0, rub_balance.reserved - order.qty *
-                                                    +                                      (order.price or 0))
+            rub_balance.reserved = max(0, rub_balance.reserved - order.qty *+(order.price or 0))
             db.add(rub_balance)
             order.status = Status.CANCELLED
             db.add(order)
@@ -730,7 +730,7 @@ async def process_limit_order(db: AsyncSession, order: Order, instrument: Instru
                 Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
                 Order.price <= order.price
             ))
-            .order_by(asc(Order.price))
+            .order_by(asc(Order.price), asc(Order.timestamp))
         )
     else:  # SELL
         # Для продажи: ищем предложения на покупку по цене >= нашей
@@ -802,6 +802,12 @@ async def process_limit_order(db: AsyncSession, order: Order, instrument: Instru
         if order.status == Status.EXECUTED:
             break
 
+    if order.filled == 0:
+        order.status = Status.NEW
+    elif 0 < order.filled < order.qty:
+        order.status = Status.PARTIALLY_EXECUTED
+    else:
+        order.status = Status.EXECUTED
     # Если после исполнения осталась неисполненная часть, добавляем в стакан
     if remaining_qty > 0 and order.status != Status.EXECUTED:
         # Ищем существующую запись в стакане
@@ -913,13 +919,16 @@ async def execute_trade(
         select(OrderBook)
         .where(OrderBook.order_id == match_order.id)
     )
-    ob = res.scalar_one_or_none()
-    if ob:
-        ob.qty = match_order.qty - match_order.filled
-        if ob.qty <= 0:
-            await db.delete(ob)
-        else:
+    ob = await db.get(OrderBook, match_order.id)
+
+    if ob is not None:
+        remaining = match_order.qty - match_order.filled
+        if remaining > 0:
+            ob.qty = remaining
             db.add(ob)
+    else:
+        await db.delete(ob)
+
     await db.flush()
 
 
