@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, field_validator
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
 from typing import Optional, Dict, List, Union
 import uuid
+from sqlalchemy.exc import IntegrityError
 from uuid import UUID, uuid4
 from models import User, Instrument, OrderBook, Transaction, Balance, Order
 from sqlalchemy import select, asc, desc, and_, delete, func, literal
@@ -150,7 +151,7 @@ class OrderBody(BaseModel):
     direction: Direction
     ticker: str
     qty: int = Field(..., ge=1)
-    price: int = Field(..., gt=0)
+    price: Optional[int] = Field(None, gt=0)
 
 class OrderCreateRequest(BaseModel):
     direction: Direction
@@ -1010,7 +1011,7 @@ async def cancel_order(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel order in {order.status} status")
-        
+
     # 4) Если рыночный ордер, просто помечаем Cancelled
     if order.price is None:
         order.status = Status.CANCELLED
@@ -1177,8 +1178,15 @@ async def delete_instrument_by_ticker(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Instrument with {ticker} ticker not found")
-    await db.delete(instrument)
-    await db.commit()
+    try:
+        await db.delete(instrument)
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete instrument: there are existing balances or orders referencing it"
+        )
     return InstrumentDeleteResponse(success=True)
 
 @app.get("/api/v1/balance", tags=["Balance"],
