@@ -583,10 +583,18 @@ async def process_market_order(db: AsyncSession, order: Order, instrument: Instr
         matching_orders = best_orders.scalars().all()
 
         if not matching_orders:
+            # нет ликвидности — освобождаем резерв RUB и кидаем 400
+            rub_balance = await get_or_create_balance(db, order.user_id, rub_instrument.id)
+            # total_cost мы заранее резервировали в create_order
+            rub_balance.reserved = max(0, rub_balance.reserved - order.qty *
+                                                    +                                      (order.price or 0))
+            db.add(rub_balance)
             order.status = Status.CANCELLED
             db.add(order)
-            await db.flush()  # Заменили commit на flush
-            return
+            await db.flush()
+
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail = "Insufficient liquidity for market buy")
 
         # Рассчитываем максимальную возможную стоимость
         max_price = await db.execute(
@@ -629,15 +637,15 @@ async def process_market_order(db: AsyncSession, order: Order, instrument: Instr
         )
         matching_orders = best_orders.scalars().all()
         if not matching_orders:
+        # нет ликвидности — освобождаем резерв токена и кидаем 400
             bal = await get_or_create_balance(db, order.user_id, instrument.id)
             bal.reserved = max(0, bal.reserved - order.qty)
             db.add(bal)
-
             order.status = Status.CANCELLED
             db.add(order)
             await db.flush()
-
-            return
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail = "Insufficient liquidity for market sell")
     remaining_qty = order.qty
     actual_cost = 0  # Для отслеживания фактической стоимости сделки
 
@@ -731,6 +739,23 @@ async def process_limit_order(db: AsyncSession, order: Order, instrument: Instru
         )
 
     matching_orders = matching_orders.scalars().all()
+    remaining_qty = order.qty
+
+    if order.direction == Direction.BUY:
+        q = select(Order).where(and_(
+            Order.ticker == order.ticker,
+            Order.direction == Direction.SELL,
+            Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
+            Order.price <= order.price)).order_by(asc(Order.price), asc(Order.timestamp))
+    else:
+        q = select(Order).where(and_(
+            Order.ticker == order.ticker,
+            Order.direction == Direction.BUY,
+            Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
+            Order.price >= order.price
+            )).order_by(desc(Order.price), asc(Order.timestamp))
+
+    matching_orders = (await db.execute(q)).scalars().all()
     remaining_qty = order.qty
 
     # Исполняем совпадающие ордера
@@ -877,7 +902,11 @@ async def execute_trade(
 
     # скорректировать запись в OrderBook для встречного ордера
     # (match_order.id совпадает с order_id в OrderBook)
-    ob = await db.get(OrderBook, match_order.id)  # ← тут нужен доступ к match_order
+    res = await db.execute(
+        select(OrderBook)
+        .where(OrderBook.order_id == match_order.id)
+    )
+    ob = res.scalar_one_or_none()
     if ob:
         ob.qty = match_order.qty - match_order.filled
         if ob.qty <= 0:
@@ -1047,12 +1076,20 @@ async def cancel_order(
             db.add(rub_bal)
 
         # 4b) Обновляем или удаляем запись из OrderBook
-        ob = await db.get(OrderBook, order.id)
+        result = await db.execute(
+            select(OrderBook)
+            .where(OrderBook.order_id == order.id)
+        )
+        ob = result.scalar_one_or_none()
+
         if ob:
+            unfilled = order.qty - order.filled
             if unfilled > 0:
+                # обновляем остаток
                 ob.qty = unfilled
                 db.add(ob)
             else:
+                # удаляем запись, если ничего не осталось
                 await db.delete(ob)
 
         order.status = Status.CANCELLED
@@ -1133,7 +1170,7 @@ async def create_instrument(
             detail="Invalid API key")
     existing = await db.execute(select(Instrument).where(Instrument.ticker == data.ticker))
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Ticker already exists")
+        return InstrumentAddResponse(success=True)
     if (requesting_user.role != UserRole.ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1179,6 +1216,10 @@ async def delete_instrument_by_ticker(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Instrument with {ticker} ticker not found")
     try:
+        await db.execute(delete(Balance).where(Balance.instrument_id == instrument.id))
+        await db.execute(delete(Order).where(Order.ticker == ticker))
+        await db.execute(delete(OrderBook).where(OrderBook.ticker == ticker))
+        await db.execute(delete(Transaction).where(Transaction.ticker == ticker))
         await db.delete(instrument)
         await db.commit()
     except IntegrityError:
