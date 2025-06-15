@@ -870,6 +870,10 @@ async def execute_trade(
         [buyer_balance, seller_balance, buyer_rub_balance, seller_rub_balance, buyer_transaction, seller_transaction])
     await db.flush()
 
+    match_order.filled += qty
+    match_order.status = Status.EXECUTED if match_order.filled >= match_order.qty else Status.PARTIALLY_EXECUTED
+    db.add(match_order)
+
     # скорректировать запись в OrderBook для встречного ордера
     # (match_order.id совпадает с order_id в OrderBook)
     ob = await db.get(OrderBook, match_order.id)  # ← тут нужен доступ к match_order
@@ -1006,69 +1010,55 @@ async def cancel_order(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot cancel order in {order.status} status")
+        
+    # 4) Если рыночный ордер, просто помечаем Cancelled
+    if order.price is None:
+        order.status = Status.CANCELLED
+        db.add(order)
 
-    # Для ордеров на продажу: освобождаем зарезервированные средства
-    if order.direction == Direction.SELL:
-        # Находим инструмент
-        instrument = await db.execute(
-            select(Instrument).where(Instrument.ticker == order.ticker)
-        )
-        instrument = instrument.scalar_one_or_none()
+    else:
+        # Это лимитный ордер — возвращаем резерв и подправляем стакан
+        unfilled = order.qty - order.filled
 
-        if instrument:
-            # Находим баланс пользователя
-            balance = await db.execute(
+        # 4a) Снимаем резерв
+        if order.direction == Direction.SELL:
+            # резервы токена
+            bal_q = await db.execute(
                 select(Balance)
                 .where(and_(
                     Balance.user_id == order.user_id,
-                    Balance.instrument_id == instrument.id
+                    Balance.instrument_id == await db.scalar(
+                        select(Instrument.id).where(Instrument.ticker == order.ticker)
+                    )
                 ))
             )
-            balance = balance.scalar_one_or_none()
+            bal = bal_q.scalar_one_or_none()
+            if bal:
+                bal.reserved = max(0, bal.reserved - unfilled)
+                db.add(bal)
 
-            if balance:
-                # Рассчитываем неисполненную часть
-                unfilled_qty = order.qty - order.filled
-                # Уменьшаем резерв и защищаем от отрицательных значений
-                balance.reserved = max(0, balance.reserved - unfilled_qty)
-                db.add(balance)
-    elif order.direction == Direction.BUY and order.price is not None:
-        # Находим RUB инструмент
-        rub_instrument = await db.execute(
-            select(Instrument).where(Instrument.ticker == "RUB")
-        )
-        rub_instrument = rub_instrument.scalar_one_or_none()
-
-        if rub_instrument:
-            # Находим баланс пользователя
-            rub_balance = await db.execute(
-                select(Balance)
-                .where(and_(
-                    Balance.user_id == order.user_id,
-                    Balance.instrument_id == rub_instrument.id
-                ))
+        else:  # limit BUY
+            rub_id = await db.scalar(
+                select(Instrument.id).where(Instrument.ticker == "RUB")
             )
-            rub_balance = rub_balance.scalar_one_or_none()
+            rub_bal = await get_or_create_balance(db, order.user_id, rub_id)
+            rub_bal.reserved = max(0, rub_bal.reserved - unfilled * order.price)
+            db.add(rub_bal)
 
-            if rub_balance:
-                # Рассчитываем неисполненную часть
-                unfilled_qty = order.qty - order.filled
-                cost_to_release = unfilled_qty * (
-                    order.price if order.price else await get_max_ask_price(db, order.ticker))
-                rub_balance.reserved = max(0, rub_balance.reserved - cost_to_release)
-                db.add(rub_balance)
+        # 4b) Обновляем или удаляем запись из OrderBook
+        ob = await db.get(OrderBook, order.id)
+        if ob:
+            if unfilled > 0:
+                ob.qty = unfilled
+                db.add(ob)
+            else:
+                await db.delete(ob)
 
-    # Удаляем из стакана по ID ордера
-    await db.execute(
-        delete(OrderBook)
-        .where(OrderBook.order_id == order.id)
-    )
+        order.status = Status.CANCELLED
+        db.add(order)
 
-    # Помечаем ордер как отмененный
-    order.status = Status.CANCELLED
-    db.add(order)
+    # 5) Сохраняем изменения
     await db.commit()
-
     return OrderDeleteResponse(success=True)
 
 @app.delete("/api/v1/admin/user/{user_id}",
