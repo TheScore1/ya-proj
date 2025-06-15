@@ -262,7 +262,6 @@ async def get_transactions_by_ticker(
                     for row in result.scalars()]
     return transactions
 
-
 @app.post("/api/v1/order",
           response_model=OrderCreateResponse,
           tags=["Order"],
@@ -317,7 +316,7 @@ async def create_order(
     if data.price is None:  # Рыночный ордер
         if data.direction == Direction.BUY:# --- НАЧАЛО БЛОКА market-buy ---
             # 1) Берём все доступные asks по возрастанию цены
-            result = await db.execute(
+            asks_q = await db.execute(
                 select(Order)
                 .where(and_(
                     Order.ticker == data.ticker,
@@ -327,9 +326,8 @@ async def create_order(
                 ))
                 .order_by(asc(Order.price))
             )
-            asks = result.scalars().all()
+            asks = asks_q.scalars().all()
 
-            # 2) Аккумулируем объём и стоимость по уровням, пока не набрали data.qty
             remaining = data.qty
             total_cost = 0
             for ask in asks:
@@ -341,25 +339,45 @@ async def create_order(
                     break
 
             if remaining > 0:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Insufficient liquidity for market buy"
-                )
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="Insufficient liquidity for market buy")
 
-            # 3) Проверяем и резервируем RUB
+            # Проверяем и резервируем RUB
             rub_balance = await get_or_create_balance(db, requesting_user.id, rub_instrument.id)
             available_rub = rub_balance.amount - rub_balance.reserved
             if available_rub < total_cost:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Insufficient available RUB. Available: {available_rub}, Required: {total_cost}"
-                )
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"Insufficient available RUB. Available: {available_rub}, Required: {total_cost}")
             rub_balance.reserved += total_cost
             db.add(rub_balance)
             await db.flush()
+
         else:  # Рыночная продажа
             # Проверка наличия спроса на покупку
-            active_buy_orders = await db.execute(
+            bal_q = await db.execute(
+                select(Balance)
+                .where(and_(
+                    Balance.user_id == requesting_user.id,
+                    Balance.instrument_id == instrument.id
+                ))
+            )
+            bal = bal_q.scalar_one_or_none()
+            available_token = (bal.amount - bal.reserved) if bal else 0
+            if available_token < data.qty:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"Insufficient available balance. Available: {available_token}, Requested: {data.qty}")
+            if not bal:
+                bal = Balance(user_id=requesting_user.id,
+                              instrument_id=instrument.id,
+                              amount=0,
+                              reserved=data.qty)
+            else:
+                bal.reserved += data.qty
+            db.add(bal)
+            await db.flush()
+
+            # Ищем встречные BUY‑ордеры
+            buys_q = await db.execute(
                 select(Order)
                 .where(and_(
                     Order.ticker == data.ticker,
@@ -369,13 +387,14 @@ async def create_order(
                 ))
                 .order_by(desc(Order.price))
             )
-            matching_orders = active_buy_orders.scalars().all()
-
+            matching_orders = buys_q.scalars().all()
             if not matching_orders:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No bids available for market sell"
-                )
+                # нет встречных — возвращаем резерв и кидаем 400
+                bal.reserved = max(0, bal.reserved - data.qty)
+                db.add(bal)
+                await db.flush()
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="No bids available for market sell")
 
     # Для ордеров на продажу: проверка и резервирование баланса
     if data.direction == Direction.SELL:
@@ -522,6 +541,7 @@ async def create_order(
             detail=f"Error processing order: {str(e)}"
         )
 
+    await db.commit()
     return OrderCreateResponse(
         success=True,
         order_id=str(order.id))
