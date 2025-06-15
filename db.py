@@ -10,15 +10,13 @@ ssl_ctx.load_verify_locations(root_cert)
 ssl_ctx.verify_mode = ssl.CERT_REQUIRED
 ssl_ctx.check_hostname = True
 
-# DATABASE_URL = "postgresql+asyncpg://postgres:Nsy8OCDi@127.0.0.1:5432/mydb"
-
 DATABASE_URL = (
     "postgresql+asyncpg://appuser:2ubnCzRS@"
-    "rc1a-a56jmq7ajqdlpu49.mdb.yandexcloud.net:6432/db1"
+    "rc1a-0hq403l11fvi5ol5.mdb.yandexcloud.net:6432/db1"
 )
 
 engine = create_async_engine(DATABASE_URL, echo=True, connect_args={
-        "ssl": ssl_ctx     # передаём SSLContext прямо драйверу asyncpg
+        "ssl": ssl_ctx
     }
 )
 AsyncSessionLocal = sessionmaker(
