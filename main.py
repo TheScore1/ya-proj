@@ -259,8 +259,15 @@ async def get_transactions_by_ticker(
         .where(Transaction.ticker == ticker)
         .order_by(desc(Transaction.timestamp))
         .limit(limit))
-    transactions = [TransactionItem(ticker=row.ticker, amount=row.qty, price=row.price, timestamp=row.timestamp)
-                    for row in result.scalars()]
+    transactions = [
+        TransactionItem(
+            ticker=row.ticker,
+            amount=row.qty,
+            price=row.price,
+            timestamp=row.timestamp)
+        for row in result.scalars()
+    ]
+    # 3) просто возвращаем список (он может быть пустым)
     return transactions
 
 @app.post("/api/v1/order",
@@ -1156,6 +1163,8 @@ async def create_instrument(
     data: InstrumentAddRequest,
     authorization: str = Security(api_key_header),
     db: AsyncSession = Depends(get_db)):
+    if not data.name.strip():##########################
+        raise HTTPException(400, "Name must be non‑empty") #################
     if not authorization.upper().startswith("TOKEN "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1168,13 +1177,17 @@ async def create_instrument(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key")
-    existing = await db.execute(select(Instrument).where(Instrument.ticker == data.ticker))
-    if existing.scalar_one_or_none():
-        return InstrumentAddResponse(success=True)
     if (requesting_user.role != UserRole.ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can create Instruments")
+    existing = await db.execute(select(Instrument).where(Instrument.ticker == data.ticker))
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail = f"Instrument with ticker {data.ticker} already exists")
+    #if existing.scalar_one_or_none():
+    #    return InstrumentAddResponse(success=True)
     instrument = Instrument(
         ticker=data.ticker,
         name=data.name)
