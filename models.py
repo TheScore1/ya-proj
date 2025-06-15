@@ -24,7 +24,7 @@ class OrderBook(Base):
     __tablename__ = "order_book"
 
     id = Column(UUID, primary_key=True, index=True, default=uuid.uuid4)
-    order_id = Column(UUID, ForeignKey("orders.id", ondelete="CASCADE"))  # Ссылка на ордер
+    order_id = Column(UUID, ForeignKey("orders.id", ondelete="CASCADE"), unique=True)  # Ссылка на ордер
     ticker = Column(String, index=True)
     side = Column(String, index=True)
     price = Column(Integer, index=True)

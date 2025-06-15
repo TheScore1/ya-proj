@@ -315,9 +315,9 @@ async def create_order(
 
     # Для рыночных ордеров: дополнительные проверки
     if data.price is None:  # Рыночный ордер
-        if data.direction == Direction.BUY:
-            # Проверка наличия предложений на продажу
-            active_sell_orders = await db.execute(
+        if data.direction == Direction.BUY:# --- НАЧАЛО БЛОКА market-buy ---
+            # 1) Берём все доступные asks по возрастанию цены
+            result = await db.execute(
                 select(Order)
                 .where(and_(
                     Order.ticker == data.ticker,
@@ -327,52 +327,36 @@ async def create_order(
                 ))
                 .order_by(asc(Order.price))
             )
-            bal = await db.execute(select(Balance)
-                                   .where(and_(Balance.user_id == requesting_user.id,
-                                               Balance.instrument_id == instrument.id)))
-            bal = bal.scalar_one_or_none()
-            available = (bal.amount - bal.reserved) if bal else 0
-            if available < data.qty:
-                raise HTTPException(400,
-                                    f"Insufficient available balance. Available: {available}, Requested: {data.qty}")
-            # потом зарезервировать
-            bal.reserved += data.qty
-            db.add(bal)
+            asks = result.scalars().all()
 
-            matching_orders = active_sell_orders.scalars().all()
+            # 2) Аккумулируем объём и стоимость по уровням, пока не набрали data.qty
+            remaining = data.qty
+            total_cost = 0
+            for ask in asks:
+                available_qty = ask.qty - ask.filled
+                take = min(remaining, available_qty)
+                total_cost += take * ask.price
+                remaining -= take
+                if remaining == 0:
+                    break
 
-            if not matching_orders:
+            if remaining > 0:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No asks available for market buy"
+                    detail="Insufficient liquidity for market buy"
                 )
 
-
-            # Находим максимальную цену в стакане
-            max_ask = await db.execute(
-                select(func.max(OrderBook.price))
-                .where(and_(
-                    OrderBook.ticker == data.ticker,
-                    OrderBook.side == "ask"
-                ))
-            )
-            max_price = max(order.price for order in matching_orders)
-            total_cost = data.qty * max_price
-
-            # Проверка баланса
+            # 3) Проверяем и резервируем RUB
             rub_balance = await get_or_create_balance(db, requesting_user.id, rub_instrument.id)
             available_rub = rub_balance.amount - rub_balance.reserved
-
             if available_rub < total_cost:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Insufficient available RUB balance. Available: {available_rub}, Required: {total_cost}"
+                    detail=f"Insufficient available RUB. Available: {available_rub}, Required: {total_cost}"
                 )
-
-                # Резервируем средства
             rub_balance.reserved += total_cost
             db.add(rub_balance)
-
+            await db.flush()
         else:  # Рыночная продажа
             # Проверка наличия спроса на покупку
             active_buy_orders = await db.execute(
@@ -623,6 +607,16 @@ async def process_market_order(db: AsyncSession, order: Order, instrument: Instr
             .order_by(desc(Order.price))
         )
         matching_orders = best_orders.scalars().all()
+        if not matching_orders:
+            bal = await get_or_create_balance(db, order.user_id, instrument.id)
+            bal.reserved = max(0, bal.reserved - order.qty)
+            db.add(bal)
+
+            order.status = Status.CANCELLED
+            db.add(order)
+            await db.flush()
+
+            return
     remaining_qty = order.qty
     actual_cost = 0  # Для отслеживания фактической стоимости сделки
 
@@ -653,6 +647,7 @@ async def process_market_order(db: AsyncSession, order: Order, instrument: Instr
             db=db,
             ticker=order.ticker,
             qty=execution_qty,
+            match_order=match_order,
             price=execution_price,
             buyer_id=order.user_id if order.direction == Direction.BUY else match_order.user_id,
             seller_id=order.user_id if order.direction == Direction.SELL else match_order.user_id,
@@ -731,6 +726,7 @@ async def process_limit_order(db: AsyncSession, order: Order, instrument: Instru
             db=db,
             ticker=order.ticker,
             qty=execution_qty,
+            match_order=match_order,
             price=execution_price,
             buyer_id=order.user_id if order.direction == Direction.BUY else match_order.user_id,
             seller_id=order.user_id if order.direction == Direction.SELL else match_order.user_id,
@@ -791,6 +787,7 @@ async def execute_trade(
     ticker: str,
     qty: int,
     price: int,
+    match_order: Order,
     buyer_id: UUID,
     seller_id: UUID,
     instrument_id: UUID
@@ -847,11 +844,21 @@ async def execute_trade(
         side='sell',
         user_id=seller_id
     )
-    db.add(buyer_transaction)
-    db.add(seller_transaction)
+    db.add_all([buyer_transaction, seller_transaction])
 
     db.add_all(
         [buyer_balance, seller_balance, buyer_rub_balance, seller_rub_balance, buyer_transaction, seller_transaction])
+    await db.flush()
+
+    # скорректировать запись в OrderBook для встречного ордера
+    # (match_order.id совпадает с order_id в OrderBook)
+    ob = await db.get(OrderBook, match_order.id)  # ← тут нужен доступ к match_order
+    if ob:
+        ob.qty = match_order.qty - match_order.filled
+        if ob.qty <= 0:
+            await db.delete(ob)
+        else:
+            db.add(ob)
     await db.flush()
 
 
@@ -1337,38 +1344,3 @@ async def withdraw(
     await db.commit()
 
     return BalanceDepositResponse(success=True)
-
-@app.get("/api/v1/hi/{name}",
-         tags=["Cloud Functions"])
-async def say_hi(name: str):
-    # Формируем URL для вызова Yandex Cloud Function
-    url = f"https://functions.yandexcloud.net/d4ebr3kc3i5nsae4jgic?name={name}"
-
-    # Выполняем асинхронный HTTP-запрос к функции
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url)
-
-    # Возвращаем текстовый ответ, статус и заголовки
-    return Response(
-        content=response.text,
-        status_code=response.status_code,
-        media_type="text/plain"
-    )
-
-@app.get("/api/v1/agify/{name}",
-         tags=["Cloud Functions"])
-async def get_age(name: str):
-    url = f"https://functions.yandexcloud.net/d4eh3018rdcg5lrq2vqu?name={name}"
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url)
-    return response.json()
-
-@app.get("/instance-id",
-         tags=["Cloud Functions"])
-def get_instance_id():
-    try:
-        resp = requests.get(METADATA_URL, headers=METADATA_HEADERS, timeout=1.0)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Metadata service error: {e}")
-    return {"instance_id": resp.text}
