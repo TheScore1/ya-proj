@@ -327,6 +327,17 @@ async def create_order(
                 ))
                 .order_by(asc(Order.price))
             )
+            bal = await db.execute(select(Balance)
+                                   .where(and_(Balance.user_id == requesting_user.id,
+                                               Balance.instrument_id == instrument.id)))
+            bal = bal.scalar_one_or_none()
+            available = (bal.amount - bal.reserved) if bal else 0
+            if available < data.qty:
+                raise HTTPException(400,
+                                    f"Insufficient available balance. Available: {available}, Requested: {data.qty}")
+            # потом зарезервировать
+            bal.reserved += data.qty
+            db.add(bal)
 
             matching_orders = active_sell_orders.scalars().all()
 
@@ -478,12 +489,27 @@ async def create_order(
     db.add(order)
     await db.flush()
 
+    # если это лимитный ордер (price is not None), сразу добавляем стакан
+    if data.price is not None:
+        # это лимитный ордер — создаём запись в OrderBook
+        book_entry = OrderBook(
+            order_id=order.id,
+            ticker=data.ticker,
+            side="bid" if data.direction == Direction.BUY else "ask",
+            price=data.price,
+            qty=data.qty
+        )
+        db.add(book_entry)
+        await db.flush()
+
     # Обработка ордера
     try:
         if data.price is None:  # Рыночный ордер
             await process_market_order(db, order, instrument)
         else:  # Лимитный ордер
             await process_limit_order(db, order, instrument)
+    except HTTPException:
+        raise
     except Exception as e:
         # В случае ошибки отменяем ордер
         order.status = Status.CANCELLED
@@ -823,6 +849,11 @@ async def execute_trade(
     )
     db.add(buyer_transaction)
     db.add(seller_transaction)
+
+    db.add_all(
+        [buyer_balance, seller_balance, buyer_rub_balance, seller_rub_balance, buyer_transaction, seller_transaction])
+    await db.flush()
+
 
 @app.get("/api/v1/order",
           tags=["Order"],
