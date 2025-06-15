@@ -319,54 +319,240 @@ async def create_order(
         rub_instrument = Instrument(ticker="RUB", name="Russian Ruble")
         db.add(rub_instrument)
         await db.flush()
-        # 4) Создаём сам ордер (NEW, filled=0)
-        order = Order(
-            user_id=requesting_user.id,
-            direction=data.direction,
-            ticker=data.ticker,
-            qty=data.qty,
-            price=data.price,
-            status=Status.NEW,
-            timestamp=datetime.utcnow(),
-            filled=0
+
+    # Для рыночных ордеров: дополнительные проверки
+    if data.price is None:  # Рыночный ордер
+        if data.direction == Direction.BUY:# --- НАЧАЛО БЛОКА market-buy ---
+            # 1) Берём все доступные asks по возрастанию цены
+            asks_q = await db.execute(
+                select(Order)
+                .where(and_(
+                    Order.ticker == data.ticker,
+                    Order.direction == Direction.SELL,
+                    Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
+                    Order.price.isnot(None)
+                ))
+                .order_by(asc(Order.price))
+            )
+            asks = asks_q.scalars().all()
+
+            remaining = data.qty
+            total_cost = 0
+            for ask in asks:
+                available_qty = ask.qty - ask.filled
+                take = min(remaining, available_qty)
+                total_cost += take * ask.price
+                remaining -= take
+                if remaining == 0:
+                    break
+
+            if remaining > 0:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="Insufficient liquidity for market buy")
+
+            # Проверяем и резервируем RUB
+            rub_balance = await get_or_create_balance(db, requesting_user.id, rub_instrument.id)
+            available_rub = rub_balance.amount - rub_balance.reserved
+            if available_rub < total_cost:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"Insufficient available RUB. Available: {available_rub}, Required: {total_cost}")
+            rub_balance.reserved += total_cost
+            db.add(rub_balance)
+            await db.flush()
+
+        else:  # Рыночная продажа
+            # Проверка наличия спроса на покупку
+            bal_q = await db.execute(
+                select(Balance)
+                .where(and_(
+                    Balance.user_id == requesting_user.id,
+                    Balance.instrument_id == instrument.id
+                ))
+            )
+            bal = bal_q.scalar_one_or_none()
+            available_token = (bal.amount - bal.reserved) if bal else 0
+            if available_token < data.qty:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail=f"Insufficient available balance. Available: {available_token}, Requested: {data.qty}")
+            if not bal:
+                bal = Balance(user_id=requesting_user.id,
+                              instrument_id=instrument.id,
+                              amount=0,
+                              reserved=data.qty)
+            else:
+                bal.reserved += data.qty
+            db.add(bal)
+            await db.flush()
+
+            # Ищем встречные BUY‑ордеры
+            buys_q = await db.execute(
+                select(Order)
+                .where(and_(
+                    Order.ticker == data.ticker,
+                    Order.direction == Direction.BUY,
+                    Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
+                    Order.price.isnot(None)
+                ))
+                .order_by(desc(Order.price))
+            )
+            matching_orders = buys_q.scalars().all()
+            if not matching_orders:
+                # нет встречных — возвращаем резерв и кидаем 400
+                bal.reserved = max(0, bal.reserved - data.qty)
+                db.add(bal)
+                await db.flush()
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                    detail="No bids available for market sell")
+
+    # Для ордеров на продажу: проверка и резервирование баланса
+    if data.direction == Direction.SELL:
+        # Получаем баланс пользователя
+        balance = await db.execute(
+            select(Balance)
+            .where(and_(
+                Balance.user_id == requesting_user.id,
+                Balance.instrument_id == instrument.id
+            ))
         )
+        balance = balance.scalar_one_or_none()
+
+        # Рассчитываем доступное количество
+        available = balance.amount if balance else 0
+
+        # Вычитаем уже зарезервированное в других ордерах
+        reserved_result = await db.execute(
+            select(func.sum(Order.qty - Order.filled))
+            .where(and_(
+                Order.user_id == requesting_user.id,
+                Order.ticker == data.ticker,
+                Order.direction == Direction.SELL,
+                Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED])
+            ))
+        )
+        reserved = reserved_result.scalar() or 0
+        available -= reserved
+
+        if available < data.qty:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient available balance. Available: {available}, Requested: {data.qty}"
+            )
+
+        # Резервируем количество
+        if not balance:
+            balance = Balance(
+                user_id=requesting_user.id,
+                instrument_id=instrument.id,
+                amount=0,
+                reserved=data.qty
+            )
+            db.add(balance)
+        else:
+            balance.reserved += data.qty
+            db.add(balance)
+
+    elif data.direction == Direction.BUY and data.price is not None:  # Лимитная покупка
+        total_cost = data.price * data.qty
+
+        # Проверяем баланс RUB
+        rub_balance = await db.execute(
+            select(Balance)
+            .where(and_(
+                Balance.user_id == requesting_user.id,
+                Balance.instrument_id == rub_instrument.id
+            ))
+        )
+        rub_balance = rub_balance.scalar_one_or_none()
+
+        # Рассчитываем доступный баланс (общий - зарезервированный)
+        available_rub = (rub_balance.amount - rub_balance.reserved) if rub_balance else 0
+
+        if available_rub < total_cost:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient available RUB balance. Available: {available_rub}, Required: {total_cost}"
+            )
+
+        # Резервируем средства
+        if not rub_balance:
+            rub_balance = Balance(
+                user_id=requesting_user.id,
+                instrument_id=rub_instrument.id,
+                amount=0,
+                reserved=total_cost
+            )
+            db.add(rub_balance)
+        else:
+            rub_balance.reserved += total_cost
+            db.add(rub_balance)
+
+    # Создаем ордер
+    order = Order(
+        user_id=requesting_user.id,
+        direction=data.direction,
+        ticker=data.ticker,
+        qty=data.qty,
+        price=data.price,
+        status=Status.NEW,
+        timestamp=datetime.utcnow(),
+        filled=0
+    )
+    db.add(order)
+    await db.flush()
+
+    # если это лимитный ордер (price is not None), сразу добавляем стакан
+    if data.price is not None:
+        # это лимитный ордер — создаём запись в OrderBook
+        book_entry = OrderBook(
+            order_id=order.id,
+            ticker=data.ticker,
+            side="bid" if data.direction == Direction.BUY else "ask",
+            price=data.price,
+            qty=data.qty
+        )
+        db.add(book_entry)
+        await db.flush()
+
+    # Обработка ордера
+    try:
+        if data.price is None:  # Рыночный ордер
+            await process_market_order(db, order, instrument)
+        else:  # Лимитный ордер
+            await process_limit_order(db, order, instrument)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # В случае ошибки отменяем ордер
+        order.status = Status.CANCELLED
         db.add(order)
         await db.flush()
 
-        # 5) Для лимитных — сразу в стакан
-        if data.price is not None:
-            book_entry = OrderBook(
-                order_id=order.id,
-                ticker=data.ticker,
-                side="bid" if data.direction == Direction.BUY else "ask",
-                price=data.price,
-                qty=data.qty
-            )
-            db.add(book_entry)
-            await db.flush()
+        # Возвращаем зарезервированные средства
+        if data.direction == Direction.BUY:
+            # Для рыночных и лимитных покупок
+            cost_to_release = data.qty * (data.price if data.price else
+                                          await get_max_ask_price(db, data.ticker))
 
-        # 6) Отправляем в процессинг (там и резерв, и matching)
-        try:
-            if data.price is None:
-                await process_market_order(db, order, instrument)
-            else:
-                await process_limit_order(db, order, instrument)
-        except HTTPException:
-            # пробрасываем HTTPException как есть
-            raise
-        except Exception as e:
-            # в случае непредвиденной ошибки откатываем статус
-            order.status = Status.CANCELLED
-            db.add(order)
-            await db.flush()
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Error processing order: {str(e)}"
-            )
+            if rub_balance:
+                rub_balance.reserved = max(0, rub_balance.reserved - cost_to_release)
+                db.add(rub_balance)
 
-        # 7) Финальный коммит и ответ
-        await db.commit()
-        return OrderCreateResponse(success=True, order_id=str(order.id))
+        elif data.direction == Direction.SELL:
+            # Для продаж
+            if balance:
+                balance.reserved = max(0, balance.reserved - data.qty)
+                db.add(balance)
+
+        await db.flush()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error processing order: {str(e)}"
+        )
+
+    await db.commit()
+    return OrderCreateResponse(
+        success=True,
+        order_id=str(order.id))
 
 async def get_max_ask_price(db: AsyncSession, ticker: str) -> int:
     result = await db.execute(
@@ -383,121 +569,151 @@ async def process_market_order(db: AsyncSession, order: Order, instrument: Instr
         select(Instrument).where(Instrument.ticker == "RUB")
     )
     rub_instrument = rub_instrument.scalar_one_or_none()
-
     if not rub_instrument:
         rub_instrument = Instrument(ticker="RUB", name="Russian Ruble")
         db.add(rub_instrument)
         await db.flush()
 
-    token_balance = await get_or_create_balance(db, order.user_id, instrument.id)
-    rub_balance = await get_or_create_balance(db, order.user_id, rub_instrument.id)
-
-    remaining = order.qty
-    initial_reserved = 0
-
     # Определяем направление ордера
     if order.direction == Direction.BUY:
-        q = select(Order).where(and_(
-            Order.ticker == order.ticker,
-            Order.direction == Direction.SELL,
-            Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
-            Order.price.isnot(None)
-        )).order_by(asc(Order.price), asc(Order.timestamp))
-    else:  # SELL
-        q = select(Order).where(and_(
-            Order.ticker == order.ticker,
-            Order.direction == Direction.BUY,
-            Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
-            Order.price.isnot(None)
-        )).order_by(desc(Order.price), asc(Order.timestamp))
-
-    matching = (await db.execute(q)).scalars().all()
-    # считаем initial_reserved
-    for mo in matching:
-        avail = mo.qty - mo.filled
-        take = min(remaining, avail)
-        initial_reserved += take * mo.price
-        remaining -= take
-        if remaining == 0:
-            break
-
-    if remaining > 0:
-        # недостаточно ликвидности
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Insufficient liquidity for market buy"
-                if order.direction == Direction.BUY
-                else "No bids available for market sell"
-            )
+        # Для покупки: ищем лучшие предложения на продажу (самые низкие цены)
+        best_orders = await db.execute(
+            select(Order)
+            .where(and_(
+                Order.ticker == order.ticker,
+                Order.direction == Direction.SELL,
+                Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
+                Order.price.isnot(None)
+            ))
+            .order_by(asc(Order.price))
         )
+        matching_orders = best_orders.scalars().all()
 
-    # 3) Резервируем средства или инструмент
-    if order.direction == Direction.BUY:
-        rub_balance.reserved += initial_reserved
+        if not matching_orders:
+            # нет ликвидности — освобождаем резерв RUB и кидаем 400
+            rub_balance = await get_or_create_balance(db, order.user_id, rub_instrument.id)
+            # total_cost мы заранее резервировали в create_order
+            rub_balance.reserved = max(0, rub_balance.reserved - order.qty *
+                                                    +                                      (order.price or 0))
+            db.add(rub_balance)
+            order.status = Status.CANCELLED
+            db.add(order)
+            await db.flush()
+
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail = "Insufficient liquidity for market buy")
+
+        # Рассчитываем максимальную возможную стоимость
+        max_price = await db.execute(
+            select(func.max(OrderBook.price))
+            .where(and_(
+                OrderBook.ticker == order.ticker,
+                OrderBook.side == "ask"
+            ))
+        )
+        # Рассчитываем максимальную возможную стоимость (по самой высокой цене в стакане)
+        max_price = max(order.price for order in matching_orders)
+        max_possible_cost = order.qty * max_price
+
+        # Проверяем баланс RUB
+        rub_balance = await get_or_create_balance(db, order.user_id, rub_instrument.id)
+        available_rub = (rub_balance.amount - rub_balance.reserved)
+
+        # Проверяем баланс с учетом максимальной стоимости
+        if available_rub < max_possible_cost:
+            order.status = Status.CANCELLED
+            db.add(order)
+            await db.flush()  # Заменили commit на flush
+            return
+
+        # Резервируем средства
+        rub_balance.reserved += max_possible_cost
         db.add(rub_balance)
+        await db.flush()
     else:  # SELL
-        token_balance.reserved += order.qty
-        db.add(token_balance)
-
-    await db.flush()
-
-    # 4) Исполняем сами сделки
+        # Для продажи: ищем лучшие предложения на покупку (самые высокие цены)
+        best_orders = await db.execute(
+            select(Order)
+            .where(and_(
+                Order.ticker == order.ticker,
+                Order.direction == Direction.BUY,
+                Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
+                Order.price.isnot(None)
+            ))
+            .order_by(desc(Order.price))
+        )
+        matching_orders = best_orders.scalars().all()
+        if not matching_orders:
+        # нет ликвидности — освобождаем резерв токена и кидаем 400
+            bal = await get_or_create_balance(db, order.user_id, instrument.id)
+            bal.reserved = max(0, bal.reserved - order.qty)
+            db.add(bal)
+            order.status = Status.CANCELLED
+            db.add(order)
+            await db.flush()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail = "Insufficient liquidity for market sell")
     remaining_qty = order.qty
-    actual_cost = 0
+    actual_cost = 0  # Для отслеживания фактической стоимости сделки
 
-    for match_order in matching:
-        if remaining_qty == 0:
+    # Исполняем ордер по мере нахождения совпадений
+    for match_order in matching_orders:
+        if remaining_qty <= 0:
             break
 
-        avail = match_order.qty - match_order.filled
-        exec_qty = min(remaining_qty, avail)
-        price = match_order.price
-        cost = exec_qty * price
+        # Доступное количество в совпадающем ордере
+        available_qty = match_order.qty - match_order.filled
+        execution_qty = min(remaining_qty, available_qty)
+        execution_price = match_order.price
+        step_cost = execution_qty * execution_price
 
-        # подрезаем последний шаг, если не хватает резерва
-        if order.direction == Direction.BUY and cost > initial_reserved - actual_cost:
-            max_qty = (initial_reserved - actual_cost) // price
-            if max_qty == 0:
-                break
-            exec_qty = max_qty
-            cost = exec_qty * price
+        # Для BUY проверяем, что хватает зарезервированных средств
+        if order.direction == Direction.BUY:
+            # Проверяем, что хватает зарезервированных средств для этого шага
+            if step_cost > max_possible_cost - actual_cost:
+                # Рассчитываем максимально возможное количество для этого шага
+                max_qty = (max_possible_cost - actual_cost) // execution_price
+                if max_qty <= 0:
+                    break
+                execution_qty = min(execution_qty, max_qty)
+                step_cost = execution_qty * execution_price
 
+        # Создаем транзакцию
         await execute_trade(
             db=db,
             ticker=order.ticker,
-            qty=exec_qty,
-            price=price,
+            qty=execution_qty,
             match_order=match_order,
-            buyer_id=(order.user_id if order.direction == Direction.BUY else match_order.user_id),
-            seller_id=(match_order.user_id if order.direction == Direction.BUY else order.user_id),
+            price=execution_price,
+            buyer_id=order.user_id if order.direction == Direction.BUY else match_order.user_id,
+            seller_id=order.user_id if order.direction == Direction.SELL else match_order.user_id,
             instrument_id=instrument.id
         )
 
-        remaining_qty -= exec_qty
-        actual_cost += cost
+        # Обновляем статус и заполненное количество
+        order.filled += execution_qty
+        match_order.filled += execution_qty
+        actual_cost += step_cost
 
-        # обновляем исходный order
-        order.filled += exec_qty
-        order.status = (
-            Status.EXECUTED
-            if order.filled >= order.qty
-            else Status.PARTIALLY_EXECUTED
-        )
+        # Обновляем статусы ордеров
+        order.status = Status.EXECUTED if order.filled >= order.qty else Status.PARTIALLY_EXECUTED
+        match_order.status = Status.EXECUTED if match_order.filled >= match_order.qty else Status.PARTIALLY_EXECUTED
+
         db.add(order)
+        db.add(match_order)
 
-    # 5) Возвращаем неиспользованный резерв
+        remaining_qty -= execution_qty
+
+        # Если ордер полностью исполнен, выходим
+        if order.status == Status.EXECUTED:
+            break
+
+    # Для BUY ордеров возвращаем неиспользованные зарезервированные средства
     if order.direction == Direction.BUY:
-        unused = initial_reserved - actual_cost
-        if unused > 0:
-            rub_balance.reserved = max(0, rub_balance.reserved - unused)
+        unused_reserve = max_possible_cost - actual_cost
+        if unused_reserve > 0:
+            rub_balance.reserved -= unused_reserve
             db.add(rub_balance)
-    else:
-        # если остались непроданные токены — снимаем резерв токена
-        unsold = remaining_qty
-        if unsold > 0:
-            token_balance.reserved = max(0, token_balance.reserved - unsold)
-            db.add(token_balance)
 
     await db.flush()
 
@@ -514,7 +730,7 @@ async def process_limit_order(db: AsyncSession, order: Order, instrument: Instru
                 Order.status.in_([Status.NEW, Status.PARTIALLY_EXECUTED]),
                 Order.price <= order.price
             ))
-            .order_by(asc(Order.price), asc(Order.timestamp))
+            .order_by(asc(Order.price))
         )
     else:  # SELL
         # Для продажи: ищем предложения на покупку по цене >= нашей
@@ -586,12 +802,6 @@ async def process_limit_order(db: AsyncSession, order: Order, instrument: Instru
         if order.status == Status.EXECUTED:
             break
 
-    if order.filled == 0:
-        order.status = Status.NEW
-    elif 0 < order.filled < order.qty:
-        order.status = Status.PARTIALLY_EXECUTED
-    else:
-        order.status = Status.EXECUTED
     # Если после исполнения осталась неисполненная часть, добавляем в стакан
     if remaining_qty > 0 and order.status != Status.EXECUTED:
         # Ищем существующую запись в стакане
@@ -703,16 +913,13 @@ async def execute_trade(
         select(OrderBook)
         .where(OrderBook.order_id == match_order.id)
     )
-    ob = await db.get(OrderBook, match_order.id)
-
-    if ob is not None:
-        remaining = match_order.qty - match_order.filled
-        if remaining > 0:
-            ob.qty = remaining
+    ob = res.scalar_one_or_none()
+    if ob:
+        ob.qty = match_order.qty - match_order.filled
+        if ob.qty <= 0:
+            await db.delete(ob)
+        else:
             db.add(ob)
-    else:
-        await db.delete(ob)
-
     await db.flush()
 
 
@@ -970,6 +1177,9 @@ async def create_instrument(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key")
+
+
+
     if (requesting_user.role != UserRole.ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
